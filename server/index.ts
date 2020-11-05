@@ -6,14 +6,11 @@ import relayer from './helpers/relayer';
 import { pinJson } from './helpers/ipfs';
 import { verifySignature, jsonParse, sendError, hashPersonalMessage } from './helpers/utils';
 import { sendMessage } from './helpers/discord';
-import { storeProposal, storeVote } from './helpers/adapters/mysql';
+import { getActiveProposals, storeProposal, storeVote } from './helpers/adapters/mysql';
 import pkg from '../package.json';
 
-const network = process.env.NETWORK || 'testnet';
-const tokens = Object.fromEntries(
-  Object.entries(spaces).map(space => [space[1].token, space[0]])
-);
 const router = express.Router();
+const network = process.env.NETWORK || 'testnet';
 
 router.get('/', (req, res) => {
   return res.json({
@@ -27,6 +24,9 @@ router.get('/', (req, res) => {
 
 router.get('/spaces/:key?', (req, res) => {
   const { key } = req.params;
+  getActiveProposals(spaces).then((result: any) => result.forEach(count => {
+    if (spaces[count.space]) spaces[count.space]._activeProposals = count.count
+  }));
   return res.json(key ? spaces[key] : spaces);
 });
 
@@ -42,7 +42,7 @@ router.get('/:space/proposals', async (req, res) => {
           msg: {
             version: message.version,
             timestamp: message.timestamp.toString(),
-            token: message.token,
+            space: message.space,
             type: message.type,
             payload: JSON.parse(message.payload)
           },
@@ -67,7 +67,7 @@ router.get('/:space/proposal/:id', async (req, res) => {
           msg: {
             version: message.version,
             timestamp: message.timestamp.toString(),
-            token: message.token,
+            space: message.space,
             type: message.type,
             payload: JSON.parse(message.payload)
           },
@@ -91,12 +91,12 @@ router.post('/message', async (req, res) => {
 
   if (
     Object.keys(msg).length !== 5 ||
-    !msg.token ||
+    !msg.space ||
     !msg.payload ||
     Object.keys(msg.payload).length === 0
   ) return sendError(res, 'wrong signed message');
 
-  if (!tokens[msg.token])
+  if (!spaces[msg.space])
     return sendError(res, 'unknown space');
 
   if (!msg.timestamp || typeof msg.timestamp !== 'string' || msg.timestamp > (ts + 30))
@@ -153,16 +153,14 @@ router.post('/message', async (req, res) => {
       JSON.stringify(msg.payload.metadata).length > 1e4
     ) return sendError(res, 'wrong vote metadata');
 
-    const query = `SELECT * FROM messages WHERE token = ? AND id = ? AND type = 'proposal'`;
-    const proposals = await db.queryAsync(query, [msg.token, msg.payload.proposal]);
+    const query = `SELECT * FROM messages WHERE space = ? AND id = ? AND type = 'proposal'`;
+    const proposals = await db.queryAsync(query, [msg.space, msg.payload.proposal]);
     if (!proposals[0])
       return sendError(res, 'unknown proposal');
     const payload = jsonParse(proposals[0].payload);
     if (ts > payload.end || payload.start > ts)
       return sendError(res, 'not in voting window');
   }
-
-  const space = tokens[msg.token];
 
   const authorIpfsRes = await pinJson(`snapshot/${body.sig}`, {
     address: body.address,
@@ -180,17 +178,17 @@ router.post('/message', async (req, res) => {
   });
 
   if (msg.type === 'proposal') {
-    await storeProposal(space, msg.token, body, authorIpfsRes, relayerIpfsRes);
+    await storeProposal(msg.space, body, authorIpfsRes, relayerIpfsRes);
 
     const networkStr = network === 'testnet' ? 'demo.' : '';
-    let message = `${space} (${network})\n`;
+    let message = `${msg.space} (${network})\n`;
     message += `**${msg.payload.name}**\n`;
-    message += `<https://${networkStr}snapshot.page/#/${space}/proposal/${authorIpfsRes}>`;
+    message += `<https://${networkStr}snapshot.page/#/${msg.space}/proposal/${authorIpfsRes}>`;
     sendMessage(message);
   }
 
   if (msg.type === 'vote') {
-    await storeVote(space, msg.token, body, authorIpfsRes, relayerIpfsRes);
+    await storeVote(msg.space, body, authorIpfsRes, relayerIpfsRes);
   }
 
   fetch('https://snapshot.collab.land/api', {
@@ -209,7 +207,7 @@ router.post('/message', async (req, res) => {
 
   console.log(
     `Address "${body.address}"\n`,
-    `Token "${msg.token}"\n`,
+    `Space "${msg.space}"\n`,
     `Type "${msg.type}"\n`,
     `IPFS hash "${authorIpfsRes}"`
   );
